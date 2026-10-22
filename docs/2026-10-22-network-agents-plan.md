@@ -33,10 +33,12 @@ the secret reaches the agent and how the runtime restricts the agent's network.
 
 Two operational gaps also exist:
 
-- Brokers only send Telegram approval cards. One separate process must read
-  the button clicks and route them to the owning broker. That process,
-  `unyolo-telegram`, is not in the release bundle, and guided setup does not
-  install it. A host without it shows approval cards whose buttons do nothing.
+- Telegram approvals have two owners. Every broker holds the bot token and
+  sends its own cards, while a separate process, `unyolo-telegram`, reads the
+  button clicks and routes them back. That process is not in the release
+  bundle, and guided setup does not install it. A host without it shows
+  approval cards whose buttons do nothing, and the bot token sits in every
+  broker's configuration.
 - A host that still runs the older release layout can lose its broker binaries
   during a partial migration while the services keep running from deleted
   files. The next restart then fails.
@@ -59,7 +61,8 @@ Two operational gaps also exist:
 
 1. **A network agent is a broker client, not an account.** Each agent gets its
    own client id, client secret, and policy rules. No Linux account is created
-   for it.
+   for it. The client secret is a static shared secret, rotated through setup.
+   Short-lived workload credentials are not planned.
 2. **Network agents connect over TLS.** The agent listener listens on one
    address that the agents can reach and nothing else, for example a private
    overlay network address or a container bridge address. There is no plain
@@ -81,10 +84,11 @@ Two operational gaps also exist:
    allowed when the operator chooses it. Then every agent receives the CA file,
    and an OpenShell agent falls back to `in_agent` with `tls: skip` on the
    broker endpoint.
-6. **One Telegram reader per bot.** `unyolo-telegram` is the only process that
-   reads the bot's updates. It routes button clicks to each broker over the
-   broker's Operator V1 socket. Brokers keep sending cards and never read
-   updates.
+6. **One Telegram owner per bot.** `unyolo-telegram` is the only process that
+   holds the bot token. It follows each broker's Operator V1 event stream,
+   sends and updates the approval cards, reads the button clicks, and decides
+   through the owning broker's Operator V1 API. Brokers contain no Telegram
+   code and no Telegram configuration. The operator inbox stays the same.
 7. **No `sudo-broker` for network agents.** It runs host commands as root for a
    local agent account. A network agent has no such account and must not run
    host commands. Setup refuses to connect `sudo-broker` to a network agent.
@@ -115,19 +119,37 @@ delivery and enrollment.
 
 ## Work
 
-### 1. Ship the Telegram reader
+### 1. Make `unyolo-telegram` the single Telegram owner
 
-- Add `unyolo-telegram` and its systemd unit to the release bundle and the
-  release checksums and SBOM.
-- Add a Telegram step to `unyolo setup`: bot token file, chat id, and the
-  route of each installed broker. Setup takes each operator secret from the
-  broker it installs, never from a command-line value.
-- Setup installs `unyolo-telegram.service`, adds its account to the operator
-  socket group of each broker, and checks every route before it reports
+- **Cards.** For each configured broker, `unyolo-telegram` follows the
+  Operator V1 event stream (`/api/operator/v1/events`) from a cursor that it
+  stores durably. On `request.created` it reads the request, renders the card
+  with the shared renderer, sends it, and stores the message id, the rendered
+  content, and its digest. On later events it edits the card to the new state:
+  approved, denied, expired, canceled, used, or failed. A restart resumes from
+  the stored cursor and does not send a card twice.
+- **Clicks.** It accepts a click only from the configured chat and operator. It
+  matches the click to the stored message and digest, then decides through the
+  broker's Operator V1 API with the request's expected revision and an
+  idempotency key derived from the click. A repeated click returns the current
+  state and makes no second decision. Transient broker failures retry with a
+  bound, as in the current inbox.
+- **Brokers.** Remove the Telegram notifier, its outbox, and the bot token and
+  chat id settings from `gh-broker`, `hf-broker`, and `sudo-broker`. This is a
+  hard cutover: a broker that still has Telegram settings fails its config
+  check with a message that names the setting to remove.
+- **Release and setup.** Add `unyolo-telegram` and its systemd unit to the
+  release bundle, checksums, and SBOM. Add a Telegram step to `unyolo setup`:
+  bot token file, chat id, and the route of each installed broker. Setup copies
+  the bot token only into the configuration of `unyolo-telegram`, and takes
+  each operator secret from the broker it installs, never from a command-line
+  value. It installs `unyolo-telegram.service`, adds its account to each
+  broker's operator socket group, and checks every route before it reports
   success.
-- A host can run only one reader per bot. Setup refuses to install a second
-  reader for the same bot token, and the doctor reports any other running
-  reader.
+- **One owner.** Setup refuses to install a second owner for the same bot
+  token, and the doctor reports any other process that uses the bot.
+- **Docs.** Rewrite `docs/TELEGRAM_INGRESS.md` and the Telegram section of
+  `docs/CHAT_APPROVAL_SECURITY.md` for the single owner when this ships.
 
 ### 2. Add the network agent core to setup
 
@@ -170,8 +192,8 @@ delivery and enrollment.
 
 - Treat a host with the older release layout as a fresh-state cutover: setup
   installs every selected broker from one release, stops and removes the old
-  units and reader only after the new ones are installed and healthy, and
-  never deletes a binary that a running unit still uses.
+  units and Telegram process only after the new ones are installed and
+  healthy, and never deletes a binary that a running unit still uses.
 - `unyolo setup` and `unyolo repair` must refuse to remove provider files that
   belong to brokers outside the current session, instead of reconciling them
   as legacy.
@@ -195,11 +217,13 @@ An end-to-end run in a real OpenShell sandbox, with a broker installed by
   blocked by the sandbox policy.
 - No file, environment variable, or process argument in the sandbox contains
   the client secret in the default certificate mode.
-- Restarting each broker and the Telegram reader keeps pending approvals and
-  button handling working.
+- Restarting each broker and `unyolo-telegram` keeps pending approvals,
+  cards, and button handling working, and sends no duplicate cards.
+- The bot token exists only in the configuration of `unyolo-telegram`.
 - Unit and integration tests cover the network intent, the adapter contract,
-  the generated OpenShell files, the reader installation, and the refusal
-  cases.
+  the generated OpenShell files, the Telegram owner (event following, card
+  edits, click checks, idempotent decisions, restart), its installation, and
+  the refusal cases.
 
 When the `docker` and `remote` adapters ship, the same end-to-end checks run
 for them, except the secret check, which then confirms that the secret exists
@@ -210,6 +234,7 @@ only in the declared place.
 - Running brokers inside sandboxes or containers.
 - Exposing the agent listener to the internet.
 - Runtime-specific code in brokers.
+- Short-lived workload credentials for network agents.
 - Adapters for other runtimes in this plan.
 - Approving through a different chat application.
 - Compatibility with the older release layout after the cutover.
